@@ -1,21 +1,22 @@
 #include "duckdb/transaction/local_storage.hpp"
-#include "duckdb/execution/index/art/art.hpp"
-#include "duckdb/storage/table/append_state.hpp"
-#include "duckdb/storage/write_ahead_log.hpp"
+
 #include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/storage/table/row_group.hpp"
-#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/execution/index/art/art.hpp"
+#include "duckdb/execution/index/unbound_index.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
-
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
-#include "duckdb/storage/table_io_manager.hpp"
+#include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table_io_manager.hpp"
+#include "duckdb/storage/write_ahead_log.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 
 namespace duckdb {
 
 LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &table)
-    : table_ref(table), allocator(Allocator::Get(table.db)), deleted_rows(0), optimistic_writer(table),
+    : table_ref(table), allocator(Allocator::Get(table.db)), deleted_rows(0), optimistic_writer(context, table),
       merged_storage(false) {
 
 	auto types = table.GetTypes();
@@ -24,11 +25,18 @@ LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &table)
 	row_groups = make_shared_ptr<RowGroupCollection>(data_table_info, io_manager, types, MAX_ROW_ID, 0);
 	row_groups->InitializeEmpty();
 
-	data_table_info->GetIndexes().BindAndScan<ART>(context, *data_table_info, [&](ART &art) {
-		auto constraint_type = art.GetConstraintType();
-		if (constraint_type == IndexConstraintType::NONE) {
+	data_table_info->GetIndexes().Scan([&](Index &index) {
+		auto constraint = index.GetConstraintType();
+		if (constraint == IndexConstraintType::NONE) {
 			return false;
 		}
+		if (index.GetIndexType() != ART::TYPE_NAME) {
+			return false;
+		}
+		if (!index.IsBound()) {
+			return false;
+		}
+		auto &art = index.Cast<ART>();
 
 		// UNIQUE constraint.
 		vector<unique_ptr<Expression>> expressions;
@@ -39,42 +47,54 @@ LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &table)
 		}
 
 		// Create a delete index and a local index.
-		auto delete_index = make_uniq<ART>(art.GetIndexName(), constraint_type, art.GetColumnIds(),
-		                                   art.table_io_manager, std::move(delete_expressions), art.db);
+		auto &name = art.GetIndexName();
+		auto &io_manager = art.table_io_manager;
+		auto delete_index =
+		    make_uniq<ART>(name, constraint, art.GetColumnIds(), io_manager, std::move(delete_expressions), art.db);
 		delete_indexes.AddIndex(std::move(delete_index));
 
-		auto index = make_uniq<ART>(art.GetIndexName(), constraint_type, art.GetColumnIds(), art.table_io_manager,
-		                            std::move(expressions), art.db);
-		append_indexes.AddIndex(std::move(index));
+		auto append_index =
+		    make_uniq<ART>(name, constraint, art.GetColumnIds(), io_manager, std::move(expressions), art.db);
+		append_indexes.AddIndex(std::move(append_index));
 		return false;
 	});
 }
 
-LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &new_dt, LocalTableStorage &parent,
-                                     idx_t changed_idx, const LogicalType &target_type,
+LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &new_data_table, LocalTableStorage &parent,
+                                     const idx_t alter_column_index, const LogicalType &target_type,
                                      const vector<StorageIndex> &bound_columns, Expression &cast_expr)
-    : table_ref(new_dt), allocator(Allocator::Get(new_dt.db)), deleted_rows(parent.deleted_rows),
-      optimistic_writer(new_dt, parent.optimistic_writer), optimistic_writers(std::move(parent.optimistic_writers)),
-      merged_storage(parent.merged_storage) {
-	row_groups = parent.row_groups->AlterType(context, changed_idx, target_type, bound_columns, cast_expr);
+    : table_ref(new_data_table), allocator(Allocator::Get(new_data_table.db)), deleted_rows(parent.deleted_rows),
+      optimistic_collections(std::move(parent.optimistic_collections)),
+      optimistic_writer(new_data_table, parent.optimistic_writer), merged_storage(parent.merged_storage) {
+
+	// Alter the column type.
+	row_groups = parent.row_groups->AlterType(context, alter_column_index, target_type, bound_columns, cast_expr);
+	parent.row_groups->CommitDropColumn(alter_column_index);
 	parent.row_groups.reset();
+
 	append_indexes.Move(parent.append_indexes);
 }
 
-LocalTableStorage::LocalTableStorage(DataTable &new_dt, LocalTableStorage &parent, idx_t drop_idx)
-    : table_ref(new_dt), allocator(Allocator::Get(new_dt.db)), deleted_rows(parent.deleted_rows),
-      optimistic_writer(new_dt, parent.optimistic_writer), optimistic_writers(std::move(parent.optimistic_writers)),
-      merged_storage(parent.merged_storage) {
-	row_groups = parent.row_groups->RemoveColumn(drop_idx);
+LocalTableStorage::LocalTableStorage(DataTable &new_data_table, LocalTableStorage &parent,
+                                     const idx_t drop_column_index)
+    : table_ref(new_data_table), allocator(Allocator::Get(new_data_table.db)), deleted_rows(parent.deleted_rows),
+      optimistic_collections(std::move(parent.optimistic_collections)),
+      optimistic_writer(new_data_table, parent.optimistic_writer), merged_storage(parent.merged_storage) {
+
+	// Remove the column from the previous table storage.
+	row_groups = parent.row_groups->RemoveColumn(drop_column_index);
+	parent.row_groups->CommitDropColumn(drop_column_index);
 	parent.row_groups.reset();
+
 	append_indexes.Move(parent.append_indexes);
 }
 
 LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &new_dt, LocalTableStorage &parent,
                                      ColumnDefinition &new_column, ExpressionExecutor &default_executor)
     : table_ref(new_dt), allocator(Allocator::Get(new_dt.db)), deleted_rows(parent.deleted_rows),
-      optimistic_writer(new_dt, parent.optimistic_writer), optimistic_writers(std::move(parent.optimistic_writers)),
-      merged_storage(parent.merged_storage) {
+      optimistic_collections(std::move(parent.optimistic_collections)),
+      optimistic_writer(new_dt, parent.optimistic_writer), merged_storage(parent.merged_storage) {
+
 	row_groups = parent.row_groups->AddColumn(context, new_column, default_executor);
 	parent.row_groups.reset();
 	append_indexes.Move(parent.append_indexes);
@@ -104,7 +124,9 @@ idx_t LocalTableStorage::EstimatedSize() {
 	// get the index size
 	idx_t index_sizes = 0;
 	append_indexes.Scan([&](Index &index) {
-		D_ASSERT(index.IsBound());
+		if (!index.IsBound()) {
+			return false;
+		}
 		index_sizes += index.Cast<BoundIndex>().GetInMemorySize();
 		return false;
 	});
@@ -151,7 +173,7 @@ ErrorData LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, RowGr
 		}
 		mock_chunk.SetCardinality(chunk);
 		// append this chunk to the indexes of the table
-		error = DataTable::AppendToIndexes(index_list, nullptr, mock_chunk, start_row, index_append_mode);
+		error = DataTable::AppendToIndexes(index_list, delete_indexes, mock_chunk, start_row, index_append_mode);
 		if (error.HasError()) {
 			return false;
 		}
@@ -209,10 +231,10 @@ void LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, TableAppen
 		if (append_to_table) {
 			table.RevertAppendInternal(NumericCast<idx_t>(append_state.row_start));
 		}
-
-		// we need to vacuum the indexes to remove any buffers that are now empty
-		// due to reverting the appends
-		table.VacuumIndexes();
+#ifdef DEBUG
+		// Verify that our index memory is stable.
+		table.VerifyIndexBuffers();
+#endif
 		error.Throw();
 	}
 	if (append_to_table) {
@@ -220,34 +242,38 @@ void LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, TableAppen
 	}
 }
 
-OptimisticDataWriter &LocalTableStorage::CreateOptimisticWriter() {
-	auto writer = make_uniq<OptimisticDataWriter>(table_ref.get());
-	optimistic_writers.push_back(std::move(writer));
-	return *optimistic_writers.back();
+PhysicalIndex LocalTableStorage::CreateOptimisticCollection(unique_ptr<RowGroupCollection> collection) {
+	lock_guard<mutex> l(collections_lock);
+	optimistic_collections.push_back(std::move(collection));
+	return PhysicalIndex(optimistic_collections.size() - 1);
 }
 
-void LocalTableStorage::FinalizeOptimisticWriter(OptimisticDataWriter &writer) {
-	// remove the writer from the set of optimistic writers
-	unique_ptr<OptimisticDataWriter> owned_writer;
-	for (idx_t i = 0; i < optimistic_writers.size(); i++) {
-		if (optimistic_writers[i].get() == &writer) {
-			owned_writer = std::move(optimistic_writers[i]);
-			optimistic_writers.erase_at(i);
-			break;
-		}
-	}
-	if (!owned_writer) {
-		throw InternalException("Error in FinalizeOptimisticWriter - could not find writer");
-	}
-	optimistic_writer.Merge(*owned_writer);
+RowGroupCollection &LocalTableStorage::GetOptimisticCollection(const PhysicalIndex collection_index) {
+	lock_guard<mutex> l(collections_lock);
+	auto &collection = optimistic_collections[collection_index.index];
+	return *collection;
+}
+
+void LocalTableStorage::ResetOptimisticCollection(const PhysicalIndex collection_index) {
+	lock_guard<mutex> l(collections_lock);
+	optimistic_collections[collection_index.index].reset();
+}
+
+OptimisticDataWriter &LocalTableStorage::GetOptimisticWriter() {
+	return optimistic_writer;
 }
 
 void LocalTableStorage::Rollback() {
-	for (auto &writer : optimistic_writers) {
-		writer->Rollback();
-	}
-	optimistic_writers.clear();
 	optimistic_writer.Rollback();
+
+	for (auto &collection : optimistic_collections) {
+		if (!collection) {
+			continue;
+		}
+		collection->CommitDropTable();
+	}
+	optimistic_collections.clear();
+	row_groups->CommitDropTable();
 }
 
 //===--------------------------------------------------------------------===//
@@ -367,13 +393,11 @@ bool LocalStorage::NextParallelScan(ClientContext &context, DataTable &table, Pa
 }
 
 void LocalStorage::InitializeAppend(LocalAppendState &state, DataTable &table) {
-	table.InitializeIndexes(context);
 	state.storage = &table_manager.GetOrCreateStorage(context, table);
 	state.storage->row_groups->InitializeAppend(TransactionData(transaction), state.append_state);
 }
 
 void LocalStorage::InitializeStorage(LocalAppendState &state, DataTable &table) {
-	table.InitializeIndexes(context);
 	state.storage = &table_manager.GetOrCreateStorage(context, table);
 }
 
@@ -382,12 +406,13 @@ void LocalTableStorage::AppendToDeleteIndexes(Vector &row_ids, DataChunk &delete
 		return;
 	}
 
-	delete_indexes.ScanBound<ART>([&](ART &art) {
-		if (!art.IsUnique()) {
+	delete_indexes.Scan([&](Index &index) {
+		D_ASSERT(index.IsBound());
+		if (!index.IsUnique()) {
 			return false;
 		}
 		IndexAppendInfo index_append_info(IndexAppendMode::IGNORE_DUPLICATES, nullptr);
-		auto result = art.Cast<BoundIndex>().Append(delete_chunk, row_ids, index_append_info);
+		auto result = index.Cast<BoundIndex>().Append(delete_chunk, row_ids, index_append_info);
 		if (result.HasError()) {
 			throw InternalException("unexpected constraint violation on delete ART: ", result.Message());
 		}
@@ -435,14 +460,24 @@ void LocalStorage::LocalMerge(DataTable &table, RowGroupCollection &collection) 
 	storage.merged_storage = true;
 }
 
-OptimisticDataWriter &LocalStorage::CreateOptimisticWriter(DataTable &table) {
+PhysicalIndex LocalStorage::CreateOptimisticCollection(DataTable &table, unique_ptr<RowGroupCollection> collection) {
 	auto &storage = table_manager.GetOrCreateStorage(context, table);
-	return storage.CreateOptimisticWriter();
+	return storage.CreateOptimisticCollection(std::move(collection));
 }
 
-void LocalStorage::FinalizeOptimisticWriter(DataTable &table, OptimisticDataWriter &writer) {
+RowGroupCollection &LocalStorage::GetOptimisticCollection(DataTable &table, const PhysicalIndex collection_index) {
 	auto &storage = table_manager.GetOrCreateStorage(context, table);
-	storage.FinalizeOptimisticWriter(writer);
+	return storage.GetOptimisticCollection(collection_index);
+}
+
+void LocalStorage::ResetOptimisticCollection(DataTable &table, const PhysicalIndex collection_index) {
+	auto &storage = table_manager.GetOrCreateStorage(context, table);
+	storage.ResetOptimisticCollection(collection_index);
+}
+
+OptimisticDataWriter &LocalStorage::GetOptimisticWriter(DataTable &table) {
+	auto &storage = table_manager.GetOrCreateStorage(context, table);
+	return storage.GetOptimisticWriter();
 }
 
 bool LocalStorage::ChangesMade() noexcept {
@@ -492,10 +527,9 @@ void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_
 		storage.Rollback();
 		return;
 	}
-	idx_t append_count = storage.row_groups->GetTotalRows() - storage.deleted_rows;
-	table.InitializeIndexes(context);
 
-	const idx_t row_group_size = storage.row_groups->GetRowGroupSize();
+	auto append_count = storage.row_groups->GetTotalRows() - storage.deleted_rows;
+	const auto row_group_size = storage.row_groups->GetRowGroupSize();
 
 	TableAppendState append_state;
 	table.AppendLock(append_state);
@@ -505,9 +539,7 @@ void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_
 		// table is currently empty OR we are bulk appending: move over the storage directly
 		// first flush any outstanding blocks
 		storage.FlushBlocks();
-		// now append to the indexes (if there are any)
-		// FIXME: we should be able to merge the transaction-local index directly into the main table index
-		// as long we just rewrite some row-ids
+		// Append to the indexes.
 		if (table.HasIndexes()) {
 			storage.AppendToIndexes(transaction, append_state, false);
 		}
@@ -522,8 +554,10 @@ void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_
 		storage.AppendToIndexes(transaction, append_state, true);
 	}
 
-	// possibly vacuum any excess index data
-	table.VacuumIndexes();
+#ifdef DEBUG
+	// Verify that our index memory is stable.
+	table.VerifyIndexBuffers();
+#endif
 }
 
 void LocalStorage::Commit(optional_ptr<StorageCommitState> commit_state) {
@@ -549,7 +583,6 @@ void LocalStorage::Rollback() {
 			continue;
 		}
 		storage->Rollback();
-
 		entry.second.reset();
 	}
 }
@@ -600,13 +633,13 @@ void LocalStorage::AddColumn(DataTable &old_dt, DataTable &new_dt, ColumnDefinit
 	table_manager.InsertEntry(new_dt, std::move(new_storage));
 }
 
-void LocalStorage::DropColumn(DataTable &old_dt, DataTable &new_dt, idx_t removed_column) {
+void LocalStorage::DropColumn(DataTable &old_dt, DataTable &new_dt, const idx_t drop_column_index) {
 	// check if there are any pending appends for the old version of the table
 	auto storage = table_manager.MoveEntry(old_dt);
 	if (!storage) {
 		return;
 	}
-	auto new_storage = make_shared_ptr<LocalTableStorage>(new_dt, *storage, removed_column);
+	auto new_storage = make_shared_ptr<LocalTableStorage>(new_dt, *storage, drop_column_index);
 	table_manager.InsertEntry(new_dt, std::move(new_storage));
 }
 
@@ -628,16 +661,20 @@ void LocalStorage::FetchChunk(DataTable &table, Vector &row_ids, idx_t count, co
 	if (!storage) {
 		throw InternalException("LocalStorage::FetchChunk - local storage not found");
 	}
-
 	storage->row_groups->Fetch(transaction, chunk, col_ids, row_ids, count, fetch_state);
 }
 
-TableIndexList &LocalStorage::GetIndexes(DataTable &table) {
+bool LocalStorage::CanFetch(DataTable &table, const row_t row_id) {
 	auto storage = table_manager.GetStorage(table);
 	if (!storage) {
-		throw InternalException("LocalStorage::GetIndexes - local storage not found");
+		throw InternalException("LocalStorage::CanFetch - local storage not found");
 	}
-	return storage->append_indexes;
+	return storage->row_groups->CanFetch(transaction, row_id);
+}
+
+TableIndexList &LocalStorage::GetIndexes(ClientContext &context, DataTable &table) {
+	auto &storage = table_manager.GetOrCreateStorage(context, table);
+	return storage.append_indexes;
 }
 
 optional_ptr<LocalTableStorage> LocalStorage::GetStorage(DataTable &table) {

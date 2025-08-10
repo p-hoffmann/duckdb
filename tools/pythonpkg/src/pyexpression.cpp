@@ -9,6 +9,9 @@
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/default_expression.hpp"
 #include "duckdb/parser/expression/collate_expression.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 
 namespace duckdb {
 
@@ -289,7 +292,9 @@ static void PopulateExcludeList(qualified_column_set_t &exclude, py::object list
 	py::list list = py::cast<py::list>(list_p);
 	for (auto item : list) {
 		if (py::isinstance<py::str>(item)) {
-			exclude.insert(QualifiedColumnName(std::string(py::str(item))));
+			string col_str = std::string(py::str(item));
+			QualifiedColumnName qname = QualifiedColumnName::Parse(col_str);
+			exclude.insert(qname);
 			continue;
 		}
 		shared_ptr<DuckDBPyExpression> expr;
@@ -405,6 +410,25 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::LambdaExpression(const py::ob
 	}
 	auto lambda_expression = make_uniq<duckdb::LambdaExpression>(std::move(lhs), rhs.GetExpression().Copy());
 	return make_shared_ptr<DuckDBPyExpression>(std::move(lambda_expression));
+}
+
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::SQLExpression(string sql) {
+	auto conn = DuckDBPyConnection::DefaultConnection();
+	auto &context = *conn->con.GetConnection().context;
+	vector<unique_ptr<ParsedExpression>> expressions;
+	try {
+		expressions = Parser::ParseExpressionList(sql, context.GetParserOptions());
+	} catch (std::runtime_error &e) {
+		throw;
+	}
+
+	if (expressions.size() != 1) {
+		throw InvalidInputException(
+		    "Please provide only a single expression to SQLExpression, found %d expressions in the parsed string",
+		    expressions.size());
+	}
+
+	return make_shared_ptr<DuckDBPyExpression>(std::move(expressions[0]));
 }
 
 // Private methods

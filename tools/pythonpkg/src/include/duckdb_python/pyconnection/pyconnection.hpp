@@ -89,6 +89,11 @@ public:
 		}
 		return *connection;
 	}
+
+	bool ConnectionIsClosed() const {
+		return connection == nullptr;
+	}
+
 	const Connection &GetConnection() const {
 		if (!connection) {
 			ThrowConnectionException();
@@ -265,14 +270,17 @@ public:
 	unique_ptr<DuckDBPyRelation> FromParquet(const string &file_glob, bool binary_as_string, bool file_row_number,
 	                                         bool filename, bool hive_partitioning, bool union_by_name,
 	                                         const py::object &compression = py::none());
-
 	unique_ptr<DuckDBPyRelation> FromParquets(const vector<string> &file_globs, bool binary_as_string,
 	                                          bool file_row_number, bool filename, bool hive_partitioning,
 	                                          bool union_by_name, const py::object &compression = py::none());
 
+	unique_ptr<DuckDBPyRelation> FromParquetInternal(Value &&file_param, bool binary_as_string, bool file_row_number,
+	                                                 bool filename, bool hive_partitioning, bool union_by_name,
+	                                                 const py::object &compression = py::none());
+
 	unique_ptr<DuckDBPyRelation> FromArrow(py::object &arrow_object);
 
-	unordered_set<string> GetTableNames(const string &query);
+	unordered_set<string> GetTableNames(const string &query, bool qualified);
 
 	shared_ptr<DuckDBPyConnection> UnregisterPythonObject(const string &name);
 
@@ -287,6 +295,8 @@ public:
 	void Close();
 
 	void Interrupt();
+
+	double QueryProgress();
 
 	ModifiedMemoryFileSystem &GetObjectFileSystem();
 
@@ -309,7 +319,7 @@ public:
 	PandasDataFrame FetchDFChunk(const idx_t vectors_per_chunk = 1, bool date_as_object = false);
 
 	duckdb::pyarrow::Table FetchArrow(idx_t rows_per_batch);
-	PolarsDataFrame FetchPolars(idx_t rows_per_batch);
+	PolarsDataFrame FetchPolars(idx_t rows_per_batch, bool lazy);
 
 	py::dict FetchPyTorch();
 
